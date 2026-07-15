@@ -1,0 +1,140 @@
+name: Build Aseprite (Multiplatform) - Artifact Only
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-multiplatform:
+    name: Build & Package Aseprite (${{ matrix.os.name }})
+    runs-on: ${{ matrix.os.runner }}
+    permissions:
+      contents: read 
+    strategy:
+      matrix:
+        os:
+          - name: Windows
+            runner: windows-latest
+            skia-url: https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip
+            skia-arch: x64
+            executable: aseprite.exe
+            ccache: "off"
+          - name: macOS
+            runner: macos-14
+            skia-url: https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-macOS-Release-arm64.zip
+            skia-arch: arm64
+            executable: aseprite
+            ccache: "on"
+          - name: Linux
+            runner: ubuntu-latest
+            skia-url: https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Linux-Release-x64.zip
+            skia-arch: x64
+            executable: aseprite
+            ccache: "on"
+      fail-fast: false  # 某平台失败不影响其他平台构建
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install Dependencies (${{ matrix.os.name }})
+        shell: bash
+        run: |
+          if [[ "${{ matrix.os.name }}" == "Windows" ]]; then
+            # Windows 依赖：wget 和 7zip
+            choco install wget 7zip -y --no-progress
+          elif [[ "${{ matrix.os.name }}" == "macOS" ]]; then
+            # macOS 依赖：wget 和 7zip（通过 brew）
+            brew install wget 7zip
+          else
+            # Linux 依赖：系统库和工具
+            sudo apt-get update -qq
+            sudo apt-get install -y \
+              wget p7zip-full \
+              libpixman-1-dev libfreetype6-dev libharfbuzz-dev zlib1g-dev \
+              libx11-dev libxcursor-dev libxi-dev libgl1-mesa-dev libfontconfig1-dev
+          fi
+
+      - name: Install Skia
+        shell: bash
+        run: |
+          # 下载对应平台的 Skia 库并解压
+          wget ${{ matrix.os.skia-url }} -O skia.zip
+          unzip skia.zip -d skia
+
+      - uses: aseprite/get-ninja@main  # 所有平台共用 Ninja 工具
+
+      - name: Configure MSVC Environment (Windows only)
+        if: matrix.os.name == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1  # 仅 Windows 需要配置 MSVC
+
+      - name: Generate Build Files
+        shell: bash
+        run: |
+          export enable_ccache=${{ matrix.os.ccache }}
+          export laf_backend=skia
+          export enable_scripting=on
+          export skia_arch=${{ matrix.os.skia-arch }}
+
+          # macOS 额外指定最低系统版本
+          extra_cmake_args=""
+          if [[ "${{ matrix.os.name }}" == "macOS" ]]; then
+            extra_cmake_args="-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15"
+          fi
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=$enable_scripting \
+            -DENABLE_CCACHE=$enable_ccache \
+            -DLAF_BACKEND=$laf_backend \
+            -DSKIA_DIR=$(realpath skia) \
+            -DSKIA_LIBRARY_DIR=$(realpath skia/out/Release-$skia_arch) \
+            $extra_cmake_args
+
+      - name: Compile Aseprite
+        shell: bash
+        run: cd build && ninja
+
+      - name: Verify Build Output
+        shell: bash
+        run: |
+          if [[ ! -d "build/bin" ]]; then
+            echo "Error: Build output directory not found!"
+            exit 1
+          fi
+          if [[ ! -f "build/bin/${{ matrix.os.executable }}" ]]; then
+            echo "Error: ${{ matrix.os.executable }} not found in build output!"
+            exit 1
+          fi
+          ls -la build/bin
+
+      - name: Clean & Prepare Portable Package
+        working-directory: build/bin
+        shell: bash
+        run: |
+          # 仅保留可执行文件和 data 目录
+          find . -mindepth 1 ! \( -name '${{ matrix.os.executable }}' -o -name 'data' -prune \) -exec rm -rf {} +
+          echo '# Portable mode' > aseprite.ini
+
+      - name: Package as Zip
+        working-directory: build/bin
+        shell: bash
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          7z -tzip a "Aseprite-${{ matrix.os.name }}-${TIMESTAMP}.zip" *
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aseprite-${{ matrix.os.name }}-Build
+          path: build/bin/Aseprite-${{ matrix.os.name }}-*.zip
+          retention-days: 30
+          if-no-files-found: error 
